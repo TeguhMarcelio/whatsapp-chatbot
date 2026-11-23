@@ -1,0 +1,17 @@
+{
+  "name": "wa-gemini-bot",
+  "version": "1.0.0",
+  "description": "WhatsApp Bot using Baileys and Gemini API",
+  "main": "bot.js",
+  "type": "module",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "@google/genai": "latest",
+    "@whiskeysockets/baileys": "^6.7.9",
+    "adm-zip": "^0.6.1",
+    "pino": "^9.6.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
