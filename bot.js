@@ -8,7 +8,11 @@ import qrcode from 'qrcode-terminal';
 import pino from 'pino';
 import fs from 'fs/promises';
 import path from 'path';
+import { execFile, spawn } from 'child_process';
+import { promisify } from 'util';
 import AdmZip from 'adm-zip';
+
+const execFileAsync = promisify(execFile);
 
 // Load environment variables from .env (if present)
 try {
@@ -795,6 +799,98 @@ async function startBot() {
         },
         { quoted: msg }
       );
+      return;
+    }
+
+    // Command: !update
+    if (text === '!update') {
+      const allowedOwners = (process.env.OWNER_NUMBER || '')
+        .split(',')
+        .map((n) => n.replace(/\D/g, ''))
+        .filter(Boolean);
+      const senderNum = senderJid.split('@')[0].replace(/\D/g, '');
+
+      if (allowedOwners.length > 0 && !allowedOwners.includes(senderNum)) {
+        await sock.sendMessage(
+          remoteJid,
+          { text: "Maaf, command !update hanya bisa dijalankan oleh owner bot." },
+          { quoted: msg }
+        );
+        return;
+      }
+
+      await sock.sendMessage(
+        remoteJid,
+        { text: "Mengecek update dari GitHub..." },
+        { quoted: msg }
+      );
+
+      try {
+        const cwd = process.cwd();
+        const { stdout: oldHeadRaw } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd });
+        const oldHead = oldHeadRaw.trim();
+
+        await execFileAsync('git', ['pull', '--ff-only'], { cwd });
+
+        const { stdout: newHeadRaw } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd });
+        const newHead = newHeadRaw.trim();
+
+        const { stdout: latestCommitRaw } = await execFileAsync('git', ['log', '-1', '--oneline'], { cwd });
+        const latestCommit = latestCommitRaw.trim();
+
+        if (oldHead === newHead) {
+          await sock.sendMessage(
+            remoteJid,
+            { text: `Bot sudah versi terbaru.\nCommit: ${latestCommit}` },
+            { quoted: msg }
+          );
+          return;
+        }
+
+        const { stdout: diffRaw } = await execFileAsync(
+          'git',
+          ['diff', '--name-only', oldHead, newHead],
+          { cwd }
+        );
+        const changedFiles = diffRaw.split(/\r?\n/).map((f) => f.trim()).filter(Boolean);
+
+        if (changedFiles.includes('package.json') || changedFiles.includes('package-lock.json')) {
+          const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+          await execFileAsync(npmCmd, ['install'], {
+            cwd,
+            shell: process.platform === 'win32'
+          });
+        }
+
+        const fileList = changedFiles.length > 0 ? changedFiles.join(', ') : '-';
+        await sock.sendMessage(
+          remoteJid,
+          {
+            text: `Update berhasil!\nCommit: ${latestCommit}\nFile berubah: ${fileList}\n\nBot akan restart sekarang...`
+          },
+          { quoted: msg }
+        );
+
+        setTimeout(() => {
+          try {
+            sock.end(undefined);
+          } catch {}
+          const child = spawn(process.execPath, [path.resolve('bot.js')], {
+            cwd,
+            detached: true,
+            stdio: 'inherit'
+          });
+          child.unref();
+          process.exit(0);
+        }, 1500);
+      } catch (err) {
+        const errDetail = (err?.stderr || err?.message || 'Unknown error').toString().trim();
+        await sock.sendMessage(
+          remoteJid,
+          { text: `Gagal update dari GitHub:\n${errDetail}` },
+          { quoted: msg }
+        );
+      }
       return;
     }
 
