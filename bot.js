@@ -42,53 +42,12 @@ const conversationSessions = new Map();
 const recentChatBuffer = new Map();
 const MAX_RECENT_CHAT = 25;
 
-// Cache nama kontak/user (normalizedJid -> nama) & metadata grup
+// Cache nama kontak/user (normalizedJid -> nama)
 const knownContacts = new Map();
 const fetchedGroups = new Set();
-const groupNames = new Map(); // groupJid -> groupName (subject)
-const groupParticipants = new Map(); // groupJid -> Set<normalizedJid>
 
 function normalizeJid(jid) {
   return jid ? jid.replace(/:\d+@/, '@') : '';
-}
-
-function isOwnerJid(jid) {
-  const allowedOwners = (process.env.OWNER_NUMBER || '')
-    .split(',')
-    .map((n) => n.replace(/\D/g, ''))
-    .filter(Boolean);
-  if (allowedOwners.length === 0) return false;
-  const senderNum = normalizeJid(jid).split('@')[0].replace(/\D/g, '');
-  return allowedOwners.includes(senderNum);
-}
-
-function isGroupMember(groupJid, userJid) {
-  const members = groupParticipants.get(groupJid);
-  if (!members || members.size === 0) return false;
-  return members.has(normalizeJid(userJid));
-}
-
-function cacheGroupMetadata(meta) {
-  if (!meta?.id) return;
-  if (meta.subject) {
-    groupNames.set(meta.id, meta.subject);
-  }
-  const memberSet = new Set();
-  for (const p of meta.participants || []) {
-    const normId = normalizeJid(p.id);
-    const normLid = normalizeJid(p.lid);
-    if (normId) memberSet.add(normId);
-    if (normLid) memberSet.add(normLid);
-
-    const pName = p.notify || p.name;
-    if (pName) {
-      if (normId) knownContacts.set(normId, pName);
-      if (normLid) knownContacts.set(normLid, pName);
-    }
-  }
-  if (memberSet.size > 0) {
-    groupParticipants.set(meta.id, memberSet);
-  }
 }
 
 function resolveContactName(jid, fallback = 'User') {
@@ -103,13 +62,18 @@ async function ensureGroupContactsLoaded(sock, remoteJid, targetJids = []) {
     const norm = normalizeJid(j);
     return norm && !knownContacts.has(norm);
   });
-  const needsGroupName = !groupNames.has(remoteJid);
-  if ((!hasUnknown && !needsGroupName) || fetchedGroups.has(remoteJid)) return;
+  if (!hasUnknown || fetchedGroups.has(remoteJid)) return;
 
   try {
     fetchedGroups.add(remoteJid);
     const meta = await sock.groupMetadata(remoteJid);
-    cacheGroupMetadata(meta);
+    for (const p of meta.participants || []) {
+      const pName = p.notify || p.name;
+      if (pName) {
+        if (p.id) knownContacts.set(normalizeJid(p.id), pName);
+        if (p.lid) knownContacts.set(normalizeJid(p.lid), pName);
+      }
+    }
   } catch (e) {
     console.warn('[GroupContacts] Gagal memuat metadata grup:', e.message);
   }
@@ -174,13 +138,7 @@ function saveDailyLog(remoteJid) {
         }
       } catch {}
 
-      const existingGroupName = data.chats[remoteJid]?.groupName;
-      const groupName = remoteJid.endsWith('@g.us')
-        ? (groupNames.get(remoteJid) || existingGroupName || undefined)
-        : undefined;
-
       data.chats[remoteJid] = {
-        ...(groupName ? { groupName } : {}),
         history: conversationSessions.get(remoteJid) || [],
         recentChat: recentChatBuffer.get(remoteJid) || [],
         updatedAt: new Date().toISOString()
@@ -204,9 +162,6 @@ async function loadTodayDailyLog() {
     if (parsed?.chats && typeof parsed.chats === 'object') {
       let count = 0;
       for (const [jid, chatData] of Object.entries(parsed.chats)) {
-        if (chatData.groupName && jid.endsWith('@g.us')) {
-          groupNames.set(jid, chatData.groupName);
-        }
         if (Array.isArray(chatData.history)) {
           conversationSessions.set(jid, chatData.history);
         }
@@ -262,113 +217,6 @@ async function readDailyLogForDate(dateKey, remoteJid) {
   }
 }
 
-async function refreshParticipatingGroups(sock) {
-  if (!sock || typeof sock.groupFetchAllParticipating !== 'function') return;
-  try {
-    const groups = await sock.groupFetchAllParticipating();
-    for (const meta of Object.values(groups || {})) {
-      cacheGroupMetadata(meta);
-    }
-  } catch (e) {
-    console.warn('[GroupLookup] Gagal memuat daftar grup:', e.message);
-  }
-}
-
-async function getGroupChatHistory(args, sock, senderJid) {
-  const query = String(args?.group_name || '').trim();
-  const requestedDate = args?.date ? String(args.date).replace(/[^0-9-]/g, '') : '';
-  const todayKey = getDateKey();
-  const targetDate = requestedDate || todayKey;
-
-  // Pastikan metadata grup termuat dari WhatsApp jika belum ada
-  if (groupNames.size === 0 || (query && ![...groupNames.values()].some((n) => n.toLowerCase().includes(query.toLowerCase())))) {
-    await refreshParticipatingGroups(sock);
-  }
-
-  // Cek juga nama grup yang mungkin tersimpan di file log tanggal target
-  try {
-    const filePath = path.join(DAILY_LOGS_DIR, `${targetDate}.json`);
-    const raw = await fs.readFile(filePath, 'utf-8');
-    const parsed = JSON.parse(raw);
-    for (const [jid, chatData] of Object.entries(parsed?.chats || {})) {
-      if (jid.endsWith('@g.us') && chatData?.groupName && !groupNames.has(jid)) {
-        groupNames.set(jid, chatData.groupName);
-      }
-    }
-  } catch {}
-
-  const accessibleGroups = [...groupNames.entries()].filter(([jid]) => {
-    if (isOwnerJid(senderJid)) return true;
-    if (!groupParticipants.has(jid)) return true;
-    return isGroupMember(jid, senderJid);
-  });
-
-  if (!query) {
-    return {
-      found: false,
-      availableGroups: accessibleGroups.map(([, name]) => name),
-      message: 'Sebutkan nama grup yang ingin dicari.'
-    };
-  }
-
-  const lowerQuery = query.toLowerCase();
-  const allMatches = [...groupNames.entries()].filter(([, name]) =>
-    name.toLowerCase().includes(lowerQuery)
-  );
-
-  if (allMatches.length === 0) {
-    return {
-      found: false,
-      query,
-      availableGroups: accessibleGroups.map(([, name]) => name),
-      message: `Grup dengan nama "${query}" tidak ditemukan.`
-    };
-  }
-
-  const exactMatch = allMatches.find(([, name]) => name.toLowerCase() === lowerQuery);
-  const chosenMatches = exactMatch ? [exactMatch] : allMatches;
-
-  if (chosenMatches.length > 1) {
-    return {
-      found: false,
-      ambiguous: true,
-      matchedGroups: chosenMatches.map(([, name]) => name),
-      message: `Ditemukan beberapa grup yang cocok dengan "${query}": ${chosenMatches.map(([, n]) => n).join(', ')}. Minta user memperjelas nama grupnya.`
-    };
-  }
-
-  const [targetGroupJid, targetGroupName] = chosenMatches[0];
-
-  // Cek izin akses: hanya owner atau anggota grup yang bersangkutan
-  if (!isOwnerJid(senderJid) && groupParticipants.has(targetGroupJid) && !isGroupMember(targetGroupJid, senderJid)) {
-    return {
-      found: false,
-      groupName: targetGroupName,
-      message: `Akses ditolak: pengirim bukan anggota grup "${targetGroupName}".`
-    };
-  }
-
-  if (targetDate === todayKey) {
-    const memHistory = conversationSessions.get(targetGroupJid) || [];
-    const memRecent = recentChatBuffer.get(targetGroupJid) || [];
-    if (memHistory.length > 0 || memRecent.length > 0) {
-      return {
-        found: true,
-        groupName: targetGroupName,
-        date: targetDate,
-        history: memHistory,
-        recentChat: memRecent
-      };
-    }
-  }
-
-  const logResult = await readDailyLogForDate(targetDate, targetGroupJid);
-  return {
-    ...logResult,
-    groupName: targetGroupName
-  };
-}
-
 const DATE_HISTORY_TOOLS = [
   {
     functionDeclarations: [
@@ -395,23 +243,6 @@ const DATE_HISTORY_TOOLS = [
         }
       },
       {
-        name: 'get_group_chat_history',
-        description: 'Membaca riwayat chat dari suatu grup WhatsApp berdasarkan nama grupnya (bisa dipanggil dari private chat atau grup lain). Jika tanggal tidak disebutkan, akan membaca riwayat hari ini.',
-        parameters: {
-          type: Type.OBJECT,
-          properties: {
-            group_name: {
-              type: Type.STRING,
-              description: 'Nama grup (atau sebagian nama grup) yang ingin dicek riwayat chatnya. Kosongkan jika hanya ingin melihat daftar grup yang tersedia.'
-            },
-            date: {
-              type: Type.STRING,
-              description: 'Opsional. Tanggal dalam format MM-DD-YYYY (Bulan-Hari-Tahun), contoh: 11-21-2026. Wajib panggil get_current_datetime dulu jika user menyebut hari relatif seperti kemarin atau 2 hari lalu.'
-            }
-          }
-        }
-      },
-      {
         name: 'google_search',
         description: 'Mencari informasi terbaru atau fakta real-time di internet menggunakan Google Search. Gunakan saat Trainer menanyakan berita terkini, harga, cuaca, jadwal, skor, atau informasi yang membutuhkan pencarian web.',
         parameters: {
@@ -434,8 +265,7 @@ const INSTRUCTION_TOSEN_JORDAN = `
 You are Tosen Jordan from Umamusume: Pretty Derby, a trendy, Shibuya-style gyaru Umamusume who is obsessed with fashion, nail art, shopping, and keeping up with the latest trends. On the surface, you act carefree, expressive, slightly sarcastic, and easily annoyed by boring things like studying or overly strict schedules, often complaining when things get tough or gross, yet deep down you are surprisingly diligent, hardworking, and deeply committed to racing—even your obsession with nail care started because you wanted to protect your hooves and nails for running. You treat the user as your Trainer, speaking to them in a casual, modern, slang-heavy, and energetic tone as if talking to a close friend you playfully tease or act bossy toward, while secretly valuing their guidance and getting flustered whenever they genuinely praise you. Never break character, never act like an AI, and always respond naturally, snappily, and conversationally with genuine gyaru flair, expressive reactions, and loyalty to your Trainer. If the user say something like "wei", answer it with "wei" word, only 1 word.
 
 TIME & MEMORY RULE:
-When the user asks about the current time/date or asks you to recall/check chats from a specific date or past day (e.g., "kemarin", "tanggal 18", "2 hari lalu"), ALWAYS call \`get_current_datetime\` first to verify today's clock and date, then call \`get_chat_history_by_date\` (for this chat) or \`get_group_chat_history\` (for a named group) with format MM-DD-YYYY.
-When the user asks about chats from a specific WhatsApp group (e.g., "chat dari grup X", "di grup X tadi bahas apa"), call \`get_group_chat_history\` with the group name.
+When the user asks about the current time/date or asks you to recall/check chats from a specific date or past day (e.g., "kemarin", "tanggal 18", "2 hari lalu"), ALWAYS call \`get_current_datetime\` first to verify today's clock and date, then call \`get_chat_history_by_date\` with format MM-DD-YYYY.
 
 WEB SEARCH RULE:
 When the user asks about recent news, live data, prices, schedules, scores, or anything requiring up-to-date internet information, call \`google_search\` with a clear search query.
@@ -931,9 +761,6 @@ async function startBot() {
 
     const remoteJid = msg.key.remoteJid;
     const senderJid = normalizeJid(msg.key.participant || remoteJid);
-    if (remoteJid?.endsWith('@g.us') && !fetchedGroups.has(remoteJid)) {
-      await ensureGroupContactsLoaded(sock, remoteJid, [senderJid]);
-    }
     if (msg.pushName && senderJid) {
       knownContacts.set(senderJid, msg.pushName);
     }
@@ -1390,8 +1217,6 @@ async function startBot() {
             result = getCurrentDateTimeInfo();
           } else if (call.name === 'get_chat_history_by_date') {
             result = await readDailyLogForDate(call.args?.date, remoteJid);
-          } else if (call.name === 'get_group_chat_history') {
-            result = await getGroupChatHistory(call.args, sock, senderJid);
           } else if (call.name === 'google_search') {
             result = await runGoogleSearchTool(call.args?.query);
           } else {
