@@ -4,3 +4,7 @@ session_auth/
 daily_logs/
 saved_chats/
 backup/
+bot.log
+*.log
+*.zip
+*.tmp
